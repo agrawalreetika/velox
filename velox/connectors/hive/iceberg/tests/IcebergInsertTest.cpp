@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/iceberg/IcebergColumnHandle.h"
 #include "velox/connectors/hive/iceberg/IcebergConnector.h"
@@ -21,6 +22,7 @@
 #include "velox/connectors/hive/iceberg/tests/IcebergTestBase.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/vector/BaseVector.h"
 
 using namespace facebook::velox::common::testutil;
 
@@ -589,6 +591,152 @@ TEST_F(IcebergInsertTest, changedWriteDefaultAcrossInserts) {
           {makeFlatVector<int64_t>({2, 3, 4, 5}),
            makeFlatVector<double>({200.0, 201.0, 300.0, 301.0}),
            makeFlatVector<std::string>({"IN", "IN", "US", "US"})}));
+}
+
+// A null ConstantVector (the most natural encoding for an omitted column)
+// allocates only one uint64_t word regardless of its logical size.
+// BaseVector::countNulls would read ceil(size/64) words and go out-of-bounds
+// for batches > 64 rows. The sink must handle this via DecodedVector.
+TEST_F(IcebergInsertTest, writeDefaultWithConstantNullInput) {
+  const auto outputDir = TempDirectoryPath::create();
+  const auto rowType = ROW({"id", "status"}, {BIGINT(), VARCHAR()});
+  const auto handle = makeWriteDefaultHandle(
+      rowType,
+      outputDir->getPath(),
+      /*insertedColumns=*/{"id"},
+      {{"status", "ACTIVE"}});
+
+  // Build a batch where 'status' is a null ConstantVector of 128 rows
+  // (2 uint64_t words needed, but ConstantVector only allocates 1).
+  const vector_size_t kBatchSize = 128;
+  auto idVec = makeFlatVector<int64_t>(
+      kBatchSize, [](vector_size_t i) { return i + 1; });
+  auto statusVec =
+      BaseVector::createNullConstant(VARCHAR(), kBatchSize, pool());
+
+  auto batch = std::make_shared<RowVector>(
+      pool(),
+      rowType,
+      /*nulls=*/nullptr,
+      kBatchSize,
+      std::vector<VectorPtr>{idVec, statusVec});
+
+  // Must not crash, ASAN-fail, or fire a spurious VELOX_CHECK.
+  EXPECT_NO_THROW(writeThroughHandle(rowType, handle, {batch}));
+
+  // Read back: every row should have status = 'ACTIVE'.
+  auto splits = createSplitsForDirectory(outputDir->getPath());
+  ASSERT_EQ(splits.size(), 1U);
+  readFromIcebergTable(
+      rowType,
+      splits,
+      makeRowVector(
+          rowType->names(),
+          {makeFlatVector<int64_t>(
+               kBatchSize, [](vector_size_t i) { return i + 1; }),
+           makeFlatVector<std::string>(
+               kBatchSize, [](vector_size_t) { return "ACTIVE"; })}));
+}
+
+// A DictionaryVector wrapping a null base — the encoding produced by
+// IcebergMergeSink::makeInsertBatch — has nulls=nullptr at the wrapper level.
+// BaseVector::countNulls(nullptr, size) returns 0, causing the old
+// if-check to silently skip the default and the VELOX_CHECK_EQ version to
+// fire incorrectly. The sink must handle this via DecodedVector.
+TEST_F(IcebergInsertTest, writeDefaultWithDictionaryNullInput) {
+  const auto outputDir = TempDirectoryPath::create();
+  const auto rowType = ROW({"id", "status"}, {BIGINT(), VARCHAR()});
+  const auto handle = makeWriteDefaultHandle(
+      rowType,
+      outputDir->getPath(),
+      /*insertedColumns=*/{"id"},
+      {{"status", "ACTIVE"}});
+
+  const vector_size_t kBatchSize = 4;
+  auto idVec = makeFlatVector<int64_t>({10, 20, 30, 40});
+
+  // Build a DictionaryVector(nulls=nullptr) over a null flat base.
+  auto nullBase = BaseVector::createNullConstant(VARCHAR(), kBatchSize, pool());
+  auto indices = makeIndices(kBatchSize, [](vector_size_t i) { return i; });
+  auto dictStatus = BaseVector::wrapInDictionary(
+      /*nulls=*/nullptr, indices, kBatchSize, nullBase);
+
+  auto batch = std::make_shared<RowVector>(
+      pool(),
+      rowType,
+      /*nulls=*/nullptr,
+      kBatchSize,
+      std::vector<VectorPtr>{idVec, dictStatus});
+
+  EXPECT_NO_THROW(writeThroughHandle(rowType, handle, {batch}));
+
+  auto splits = createSplitsForDirectory(outputDir->getPath());
+  ASSERT_EQ(splits.size(), 1U);
+  readFromIcebergTable(
+      rowType,
+      splits,
+      makeRowVector(
+          rowType->names(),
+          {makeFlatVector<int64_t>({10, 20, 30, 40}),
+           makeFlatVector<std::string>(
+               {"ACTIVE", "ACTIVE", "ACTIVE", "ACTIVE"})}));
+}
+
+// DATE write-default is serialised by Iceberg as integer days-since-epoch
+// (e.g. "19737" = 2024-01-15). Passing isDaysSinceEpoch=false would cause
+// PartitionValue::fromString to expect an ISO string and fail/misdecode.
+TEST_F(IcebergInsertTest, writeDefaultDateType) {
+  const auto outputDir = TempDirectoryPath::create();
+  const auto rowType = ROW({"id", "dt"}, {BIGINT(), DATE()});
+
+  // "19737" = days since Unix epoch for 2024-01-15.
+  // The DATE column vector must be typed as DATE() (not INTEGER) so the
+  // Parquet writer schema matches the input RowVector type.
+  icebergAddInputWithDefault(
+      rowType,
+      outputDir->getPath(),
+      /*insertedColumns=*/{"id"},
+      {{"dt", "19737"}},
+      {makeRowVector(
+          rowType->names(),
+          {makeFlatVector<int64_t>({1, 2}),
+           makeNullableFlatVector<int32_t>(
+               {std::nullopt, std::nullopt}, DATE())})});
+
+  auto splits = createSplitsForDirectory(outputDir->getPath());
+  ASSERT_EQ(splits.size(), 1U);
+  readFromIcebergTable(
+      rowType,
+      splits,
+      makeRowVector(
+          rowType->names(),
+          {makeFlatVector<int64_t>({1, 2}),
+           // 19737 days since epoch = 2024-01-15.
+           makeFlatVector<int32_t>({19737, 19737}, DATE())}));
+}
+
+// A non-null value in a write-default column is a planner bug: the column
+// was classified as omitted at plan time so no row should ever carry a value
+// for it. The sink must surface this immediately via VELOX_CHECK.
+TEST_F(IcebergInsertTest, writeDefaultNonNullInputThrows) {
+  const auto outputDir = TempDirectoryPath::create();
+  const auto rowType = ROW({"id", "status"}, {BIGINT(), VARCHAR()});
+  const auto handle = makeWriteDefaultHandle(
+      rowType,
+      outputDir->getPath(),
+      /*insertedColumns=*/{"id"},
+      {{"status", "ACTIVE"}});
+
+  // 'status' has a non-null value in row 1 — contradicts its omitted
+  // classification. The sink must throw.
+  auto batch = makeRowVector(
+      rowType->names(),
+      {makeFlatVector<int64_t>({1, 2}),
+       makeNullableFlatVector<std::string>({"EXPLICIT", std::nullopt})});
+
+  VELOX_ASSERT_THROW(
+      writeThroughHandle(rowType, handle, {batch}),
+      "Non-null value found at row 0 in write-default column 'status'");
 }
 
 #endif

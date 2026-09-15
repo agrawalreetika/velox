@@ -49,6 +49,7 @@
 #include "velox/dwio/dwrf/writer/Writer.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/type/Type.h"
+#include "velox/vector/DecodedVector.h"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -392,14 +393,15 @@ IcebergDataSink::IcebergDataSink(
     const bool isOmittedColumn = !insertedColSet.empty() &&
         insertedColSet.find(columnHandle->name()) == insertedColSet.end();
     if (writeDefault.has_value() && isOmittedColumn) {
+      const auto& colType = inputType_->childAt(i);
       writeDefaultColumns_.push_back(
           {i,
            newConstantFromString(
-               inputType_->childAt(i),
+               colType,
                writeDefault.value(),
                connectorQueryCtx_->memoryPool(),
-               false,
-               false)});
+               /*isLocalTimestamp=*/false,
+               /*isDaysSinceEpoch=*/colType->isDate())});
     }
   }
 
@@ -416,15 +418,22 @@ void IcebergDataSink::appendData(RowVectorPtr input) {
   if (!writeDefaultColumns_.empty()) {
     std::vector<VectorPtr> children(input->children());
     for (const auto& col : writeDefaultColumns_) {
-      // Only replace when every row in the batch is null. Omitted columns
-      // arrive as an all-NULL vector; a partially-null column means some rows
-      // carry explicit values that must not be overwritten with the default.
-      const auto& child = children[col.index];
-      if (BaseVector::countNulls(child->nulls(), input->size()) ==
-          input->size()) {
-        children[col.index] =
-            BaseVector::wrapInConstant(input->size(), 0, col.constantVector);
+      // The set of write-default columns is fixed at plan time: a column
+      // enters writeDefaultColumns_ only when it is absent from the INSERT
+      // column list, which is a statement-level decision, so it is absent
+      // for every row in every batch. We substitute unconditionally.
+      const DecodedVector decoded(*children[col.index]);
+      for (vector_size_t i = 0; i < input->size(); ++i) {
+        VELOX_CHECK(
+            decoded.isNullAt(i),
+            "Non-null value found at row {} in write-default column '{}' "
+            "(channel {}). Omitted INSERT columns must be entirely null.",
+            i,
+            inputType_->nameOf(col.index),
+            col.index);
       }
+      children[col.index] =
+          BaseVector::wrapInConstant(input->size(), 0, col.constantVector);
     }
     input = std::make_shared<RowVector>(
         input->pool(),
